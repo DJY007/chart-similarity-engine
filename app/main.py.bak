@@ -1,0 +1,151 @@
+import os
+import shutil
+import uuid
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, Dict, Any
+
+from .vision_analyzer import ChartVisionAnalyzer
+from .data_manager import HistoricalDataManager
+from .pattern_matcher import PatternMatcher
+from .result_analyzer import ResultAnalyzer
+
+app = FastAPI(title="K线模式匹配工具")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize components
+# Note: ANTHROPIC_API_KEY should be in environment variables
+vision_analyzer = ChartVisionAnalyzer()
+data_manager = HistoricalDataManager()
+pattern_matcher = PatternMatcher()
+result_analyzer = ResultAnalyzer()
+
+# Ensure temp directory for uploads
+UPLOAD_DIR = "data/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/api/analyze")
+async def analyze_chart(
+    file: UploadFile = File(...),
+    symbol: Optional[str] = Query(None, description="交易对，如不指定则自动识别"),
+    timeframe: Optional[str] = Query(None, description="时间周期，如不指定则自动识别"),
+    top_n: int = Query(10, description="返回前N个匹配结果"),
+    min_similarity: float = Query(0.5, description="最低相似度阈值")
+):
+    """
+    主接口: 上传K线截图，返回匹配结果
+    """
+    # 1. Save uploaded file temporarily
+    file_ext = os.path.splitext(file.filename)[1]
+    temp_filename = f"{uuid.uuid4()}{file_ext}"
+    temp_path = os.path.join(UPLOAD_DIR, temp_filename)
+    
+    try:
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # 2. Vision Analysis
+        analysis = await vision_analyzer.analyze_chart(image_path=temp_path)
+        
+        # 3. Determine symbol and timeframe
+        final_symbol = symbol or analysis.get("symbol")
+        final_tf = timeframe or analysis.get("timeframe")
+        
+        if final_symbol == "UNKNOWN" or final_tf == "UNKNOWN":
+            # If still unknown, we might need to default or error
+            # For now, let's try to use a default if not provided
+            if final_symbol == "UNKNOWN": final_symbol = "BTC/USDT"
+            if final_tf == "UNKNOWN": final_tf = "1h"
+
+        # 4. Ensure historical data is available
+        try:
+            await data_manager.ensure_data(final_symbol, final_tf)
+        except Exception as e:
+            print(f"Data sync error: {e}")
+            # Continue with whatever data we have
+            
+        # 5. Get historical data for matching
+        hist_ohlcv = data_manager.get_ohlcv(final_symbol, final_tf)
+        hist_timestamps = data_manager.get_timestamps(final_symbol, final_tf)
+        
+        if len(hist_ohlcv) < 100:
+            raise HTTPException(status_code=400, detail=f"Insufficient historical data for {final_symbol} {final_tf}")
+
+        # 6. Pattern Matching
+        query_seq = np.array(analysis.get("normalized_price_sequence", []))
+        if len(query_seq) < 10:
+            raise HTTPException(status_code=400, detail="Vision analysis failed to extract a valid price sequence")
+            
+        matches = pattern_matcher.find_similar_patterns(
+            query_sequence=query_seq,
+            historical_ohlcv=hist_ohlcv,
+            historical_timestamps=hist_timestamps,
+            top_n=top_n,
+            query_ema_state=analysis.get("indicators", {}).get("ema_arrangement", "tangled"),
+            query_volume_pattern=analysis.get("indicators", {}).get("volume_pattern", "normal"),
+            min_similarity=min_similarity
+        )
+        
+        # 7. Summarize results
+        summary = result_analyzer.summarize(matches)
+        
+        # 8. Prepare response
+        return {
+            "chart_analysis": analysis,
+            "matches": matches,
+            "prediction": summary,
+            "metadata": {
+                "symbol": final_symbol,
+                "timeframe": final_tf,
+                "match_count": len(matches)
+            }
+        }
+        
+    except Exception as e:
+        print(f"Analysis error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/api/data/status")
+async def data_status():
+    """查看已缓存的历史数据状态"""
+    # Simple implementation to show what's in the DB
+    import sqlite3
+    try:
+        with sqlite3.connect(data_manager.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT symbol, timeframe, COUNT(*), MIN(timestamp), MAX(timestamp) FROM klines GROUP BY symbol, timeframe")
+            rows = cursor.fetchall()
+            status = []
+            for r in rows:
+                status.append({
+                    "symbol": r[0],
+                    "timeframe": r[1],
+                    "count": r[2],
+                    "start": r[3],
+                    "end": r[4]
+                })
+            return {"status": status}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Mount static files after API routes
+# Ensure the directory exists or this will fail
+os.makedirs("frontend/dist", exist_ok=True)
+app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="static")

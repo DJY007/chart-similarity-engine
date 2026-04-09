@@ -1,0 +1,217 @@
+import os
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ChatAction
+import aiohttp
+import json
+from datetime import datetime
+
+class ChartMatcherBot:
+    """
+    Telegram Bot 接口
+    """
+    
+    def __init__(self, token: str, api_base_url: str = "http://localhost:8000"):
+        self.token = token
+        self.api_base_url = api_base_url
+        self.app = Application.builder().token(token).build()
+        self._setup_handlers()
+        
+    def _setup_handlers(self):
+        """设置命令和消息处理器"""
+        self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(CommandHandler("help", self.help_command))
+        self.app.add_handler(CommandHandler("set_pair", self.set_pair))
+        self.app.add_handler(CommandHandler("set_timeframe", self.set_timeframe))
+        self.app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
+        
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /start 命令"""
+        welcome_text = """
+🚀 欢迎使用 K线模式匹配工具！
+
+这是一个AI驱动的加密货币行情分析工具。只需上传一张K线截图，我会：
+1. 自动识别币种和时间周期
+2. 在历史数据中找到相似走势
+3. 统计历史相似走势的后续涨跌概率
+4. 给出预测建议
+
+📸 使用方法：
+• 直接发送K线截图给我
+• 我会自动分析并返回结果
+
+⚙️ 可选命令：
+• /set_pair BTC/USDT - 设置默认交易对
+• /set_timeframe 4h - 设置默认时间周期
+• /help - 获取帮助信息
+
+⚠️ 免责声明：
+本工具仅供参考，历史模式不代表未来表现，不构成投资建议。
+        """
+        await update.message.reply_text(welcome_text)
+        
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /help 命令"""
+        help_text = """
+📖 使用帮助
+
+🎯 主要功能：
+1. 上传K线截图 - 自动分析并找到历史相似走势
+2. 查看预测摘要 - 获取上涨概率和平均收益
+3. 查看匹配详情 - 了解历史相似走势的后续表现
+
+📊 支持的交易对：
+• BTC/USDT, ETH/USDT, SOL/USDT 等
+
+⏱️ 支持的时间周期：
+• 1h, 4h, 1d 等
+
+💡 提示：
+• 确保截图中包含完整的K线和指标
+• 越清晰的截图，分析效果越好
+• 可以使用 /set_pair 和 /set_timeframe 设置默认参数
+
+❓ 有问题？
+• 确保网络连接正常
+• 尝试重新上传清晰的截图
+• 如有技术问题，请联系开发者
+        """
+        await update.message.reply_text(help_text)
+        
+    async def set_pair(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /set_pair 命令"""
+        if not context.args:
+            await update.message.reply_text("用法: /set_pair BTC/USDT")
+            return
+            
+        pair = context.args[0].upper()
+        context.user_data['default_pair'] = pair
+        await update.message.reply_text(f"✅ 默认交易对已设置为: {pair}")
+        
+    async def set_timeframe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /set_timeframe 命令"""
+        if not context.args:
+            await update.message.reply_text("用法: /set_timeframe 4h")
+            return
+            
+        tf = context.args[0].lower()
+        context.user_data['default_timeframe'] = tf
+        await update.message.reply_text(f"✅ 默认时间周期已设置为: {tf}")
+        
+    async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理用户发送的图片"""
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        
+        try:
+            # 获取图片
+            photo = update.message.photo[-1]
+            file = await context.bot.get_file(photo.file_id)
+            
+            # 下载图片
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                await file.download_to_memory(out=tmp)
+                tmp_path = tmp.name
+            
+            # 获取用户设置的参数
+            default_pair = context.user_data.get('default_pair')
+            default_tf = context.user_data.get('default_timeframe')
+            
+            # 调用后端API
+            status_msg = await update.message.reply_text("🔄 正在分析图表...")
+            
+            async with aiohttp.ClientSession() as session:
+                with open(tmp_path, 'rb') as f:
+                    form = aiohttp.FormData()
+                    form.add_field('file', f, filename='chart.jpg')
+                    if default_pair:
+                        form.add_field('symbol', default_pair)
+                    if default_tf:
+                        form.add_field('timeframe', default_tf)
+                    
+                    async with session.post(
+                        f"{self.api_base_url}/api/analyze",
+                        data=form,
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            await self._send_analysis_result(update, context, result, status_msg)
+                        else:
+                            error_text = await resp.text()
+                            await status_msg.edit_text(f"❌ 分析失败: {error_text}")
+                            
+        except Exception as e:
+            await update.message.reply_text(f"❌ 错误: {str(e)}")
+        finally:
+            # 清理临时文件
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+                
+    async def _send_analysis_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE, result: dict, status_msg):
+        """格式化并发送分析结果"""
+        try:
+            chart_analysis = result.get('chart_analysis', {})
+            prediction = result.get('prediction', {})
+            matches = result.get('matches', [])
+            
+            # 构建消息
+            message = "📊 K线模式匹配结果\n"
+            message += "━━━━━━━━━━━━━━━\n"
+            
+            # 识别信息
+            symbol = chart_analysis.get('symbol', 'UNKNOWN')
+            timeframe = chart_analysis.get('timeframe', 'UNKNOWN')
+            trend = chart_analysis.get('pattern', {}).get('trend', 'UNKNOWN')
+            
+            message += f"🎯 识别: {symbol} {timeframe}\n"
+            message += f"📈 趋势: {trend}\n"
+            message += f"置信度: {chart_analysis.get('confidence', 0)}/100\n\n"
+            
+            # 预测摘要
+            message += "🔮 预测摘要:\n"
+            bull_prob = prediction.get('bullish_probability', 0)
+            avg_return = prediction.get('avg_future_return', 0)
+            confidence = prediction.get('confidence', 'low')
+            
+            message += f"• 上涨概率: {bull_prob:.1f}%\n"
+            message += f"• 平均收益: {avg_return:+.2%}\n"
+            message += f"• 置信度: {self._confidence_emoji(confidence)} {confidence}\n\n"
+            
+            # Top 3 匹配
+            message += "📋 Top 3 匹配:\n"
+            for i, match in enumerate(matches[:3], 1):
+                sim = match.get('similarity_score', 0)
+                start_time = match.get('start_time', 'N/A')
+                future_return = match.get('future_return_1x', 0)
+                trend_emoji = "↑" if future_return > 0 else "↓"
+                
+                message += f"{i}️⃣ 相似度 {sim:.0%} | {start_time}\n"
+                message += f"   后续: {trend_emoji} {future_return:+.1%}\n"
+            
+            message += "\n⚠️ 仅供参考，不构成投资建议"
+            
+            # 编辑状态消息为最终结果
+            await status_msg.edit_text(message)
+            
+        except Exception as e:
+            await status_msg.edit_text(f"❌ 结果格式化错误: {str(e)}")
+            
+    def _confidence_emoji(self, confidence: str) -> str:
+        """根据置信度返回emoji"""
+        mapping = {
+            'high': '🟢',
+            'medium': '🟡',
+            'low': '🔴'
+        }
+        return mapping.get(confidence, '⚪')
+        
+    def run(self):
+        """启动Bot"""
+        print("🤖 Starting Telegram Bot...")
+        self.app.run_polling()
+
+def create_bot(token: str, api_base_url: str = "http://localhost:8000"):
+    """工厂函数创建Bot实例"""
+    return ChartMatcherBot(token, api_base_url)
